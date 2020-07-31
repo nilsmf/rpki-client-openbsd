@@ -80,10 +80,12 @@
  * An rsync repository.
  */
 struct	repo {
-	char	*host; /* hostname */
-	char	*module; /* module name */
-	int	 loaded; /* whether loaded or not */
-	size_t	 id; /* identifier (array index) */
+	char		*dir; /* on disk location (relative to cwd) */
+	char		*fetch_info; /* uri that is used by rrdp or rsync */
+	char		*host; /* used for finding existing */
+	char		*module; /* used for finding existing */
+	int		 loaded; /* whether loaded or not */
+	size_t		 id; /* identifier (array index) */
 };
 
 /*
@@ -195,19 +197,6 @@ filepath_exists(char *file)
 
 RB_GENERATE(filepath_tree, filepath, entry, filepathcmp);
 
-/*
- * Resolve the media type of a resource by looking at its suffice.
- * Returns the type of RTYPE_EOF if not found.
- */
-static enum rtype
-rtype_resolve(const char *uri)
-{
-	enum rtype	 rp;
-
-	rsync_uri_parse(NULL, NULL, NULL, NULL, NULL, NULL, &rp, uri);
-	return rp;
-}
-
 static void
 entity_free(struct entity *ent)
 {
@@ -303,16 +292,19 @@ entityq_flush(int fd, struct entityq *q, const struct repo *repo)
  */
 static const struct repo *
 repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
-    int proc)
+    int proc, const char **filename, enum rtype *file_type)
 {
-	const char	*host, *mod;
-	size_t		 hostsz, modsz, i;
+	const char	*host, *mod, *path;
+	size_t		 hostsz, modsz, pathsz, i;
 	struct repo	*rp;
 
-	if (!rsync_uri_parse(&host, &hostsz,
-	    &mod, &modsz, NULL, NULL, NULL, uri))
-		errx(1, "%s: malformed", uri);
+	if (rsync_uri_parse(&host, &hostsz, &mod, &modsz,
+	    &path, &pathsz, file_type, uri) == 0 || *file_type == RTYPE_EOF) {
+		warnx("url parse failed");
+		return NULL;
+	}
 
+	*filename = path;
 	/* Look up in repository table. */
 
 	for (i = 0; i < rt->reposz; i++) {
@@ -327,6 +319,8 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 		return &rt->repos[i];
 	}
 
+	/* We didn't find the repo already so lets create it */
+
 	rt->repos = reallocarray(rt->repos,
 		rt->reposz + 1, sizeof(struct repo));
 	if (rt->repos == NULL)
@@ -336,20 +330,28 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 	memset(rp, 0, sizeof(struct repo));
 	rp->id = rt->reposz - 1;
 
-	if ((rp->host = strndup(host, hostsz)) == NULL ||
-	    (rp->module = strndup(mod, modsz)) == NULL)
+	if ((rp->host = strndup(host, hostsz)) == NULL)
 		err(1, "strndup");
+	if ((rp->module = strndup(mod, modsz)) == NULL)
+		err(1, "strndup");
+	if (asprintf(&rp->dir, "%s/%s", rp->host, rp->module) == -1)
+		err(1, "asprintf");
+	if (asprintf(&rp->fetch_info, "rsync://%s/%s",
+	    rp->host, rp->module) == -1)
+		err(1, "asprintf");
 
 	i = rt->reposz - 1;
 
 	if (!noop) {
-		logx("%s/%s: pulling from network", rp->host, rp->module);
+		logx("pulling from network: %s", rp->fetch_info);
 		io_simple_write(fd, &i, sizeof(size_t));
+		io_str_write(fd, rp->dir);
+		io_str_write(fd, rp->fetch_info);
 		io_str_write(fd, rp->host);
 		io_str_write(fd, rp->module);
 	} else {
 		rp->loaded = 1;
-		logx("%s/%s: loaded from cache", rp->host, rp->module);
+		logx("loaded from cache: %s", rp->dir);
 		stats.repos++;
 		entityq_flush(proc, q, rp);
 	}
@@ -390,7 +392,7 @@ entity_buffer_resp(char **b, size_t *bsz, size_t *bmax,
  * Add the heap-allocated file to the queue for processing.
  */
 static void
-entityq_add(int fd, struct entityq *q, char *file, enum rtype type,
+entityq_add(int fd, struct entityq *q, const char *file, enum rtype type,
     const struct repo *rp, const unsigned char *dgst,
     const unsigned char *pkey, size_t pkeysz, char *descr, size_t *eid)
 {
@@ -401,7 +403,13 @@ entityq_add(int fd, struct entityq *q, char *file, enum rtype type,
 
 	p->id = (*eid)++;
 	p->type = type;
-	p->uri = file;
+	if (rp != NULL) {
+		if (asprintf(&p->uri, "%s/%s", rp->dir, file) == -1)
+			err(1, "asprintf");
+	} else {
+		if ((p->uri = strdup(file)) == NULL)
+			err(1, "strdup");
+	}
 	p->repo = (rp != NULL) ? (ssize_t)rp->id : -1;
 	p->has_dgst = dgst != NULL;
 	p->has_pkey = pkey != NULL;
@@ -418,7 +426,7 @@ entityq_add(int fd, struct entityq *q, char *file, enum rtype type,
 		if ((p->descr = strdup(descr)) == NULL)
 			err(1, "strdup");
 
-	filepath_add(file);
+	filepath_add(p->uri);
 	TAILQ_INSERT_TAIL(q, p, entries);
 
 	/*
@@ -436,7 +444,7 @@ entityq_add(int fd, struct entityq *q, char *file, enum rtype type,
  */
 static void
 queue_add_from_mft(int fd, struct entityq *q, const char *mft,
-    const struct mftfile *file, enum rtype type, size_t *eid)
+    const struct mftfile *file, enum rtype type, size_t *eid, struct repo *repo)
 {
 	size_t		 sz;
 	char		*cp, *nfile;
@@ -456,12 +464,14 @@ queue_add_from_mft(int fd, struct entityq *q, const char *mft,
 	*cp = '\0';
 	strlcat(nfile, file->file, sz + 1);
 
+	nfile += strlen(repo->dir) + 1;
+
 	/*
 	 * Since we're from the same directory as the MFT file, we know
 	 * that the repository has already been loaded.
 	 */
 
-	entityq_add(fd, q, nfile, type, NULL, file->hash, NULL, 0, NULL, eid);
+	entityq_add(fd, q, nfile, type, repo, file->hash, NULL, 0, NULL, eid);
 }
 
 /*
@@ -474,7 +484,7 @@ queue_add_from_mft(int fd, struct entityq *q, const char *mft,
  */
 static void
 queue_add_from_mft_set(int fd, struct entityq *q, const struct mft *mft,
-    size_t *eid)
+    size_t *eidi, struct repo *repo)
 {
 	size_t			 i, sz;
 	const struct mftfile	*f;
@@ -485,7 +495,7 @@ queue_add_from_mft_set(int fd, struct entityq *q, const struct mft *mft,
 		assert(sz > 4);
 		if (strcasecmp(f->file + sz - 4, ".crl"))
 			continue;
-		queue_add_from_mft(fd, q, mft->file, f, RTYPE_CRL, eid);
+		queue_add_from_mft(fd, q, mft->file, f, RTYPE_CRL, eidi, repo);
 	}
 
 	for (i = 0; i < mft->filesz; i++) {
@@ -494,7 +504,7 @@ queue_add_from_mft_set(int fd, struct entityq *q, const struct mft *mft,
 		assert(sz > 4);
 		if (strcasecmp(f->file + sz - 4, ".cer"))
 			continue;
-		queue_add_from_mft(fd, q, mft->file, f, RTYPE_CER, eid);
+		queue_add_from_mft(fd, q, mft->file, f, RTYPE_CER, eidi, repo);
 	}
 
 	for (i = 0; i < mft->filesz; i++) {
@@ -503,7 +513,7 @@ queue_add_from_mft_set(int fd, struct entityq *q, const struct mft *mft,
 		assert(sz > 4);
 		if (strcasecmp(f->file + sz - 4, ".roa"))
 			continue;
-		queue_add_from_mft(fd, q, mft->file, f, RTYPE_ROA, eid);
+		queue_add_from_mft(fd, q, mft->file, f, RTYPE_ROA, eidi, repo);
 	}
 }
 
@@ -513,10 +523,8 @@ queue_add_from_mft_set(int fd, struct entityq *q, const struct mft *mft,
 static void
 queue_add_tal(int fd, struct entityq *q, const char *file, size_t *eid)
 {
-	char	*nfile, *buf;
+	char	*buf;
 
-	if ((nfile = strdup(file)) == NULL)
-		err(1, "strdup");
 	buf = tal_read_file(file);
 
 	/* Record tal for later reporting */
@@ -530,7 +538,7 @@ queue_add_tal(int fd, struct entityq *q, const char *file, size_t *eid)
 	}
 
 	/* Not in a repository, so directly add to queue. */
-	entityq_add(fd, q, nfile, RTYPE_TAL, NULL, NULL, NULL, 0, buf, eid);
+	entityq_add(fd, q, file, RTYPE_TAL, NULL, NULL, NULL, 0, buf, eid);
 	/* entityq_add makes a copy of buf */
 	free(buf);
 }
@@ -543,23 +551,20 @@ static void
 queue_add_from_tal(int proc, int rsync, struct entityq *q,
     const struct tal *tal, struct repotab *rt, size_t *eid)
 {
-	char			*nfile;
 	const struct repo	*repo;
-	const char		*uri;
+	const char		*uri, *filename;
+	enum rtype		rtype;
 
 	assert(tal->urisz);
 	uri = tal->uri[0];
 
 	/* Look up the repository. */
 
-	assert(rtype_resolve(uri) == RTYPE_CER);
-	repo = repo_lookup(rsync, rt, uri, q, proc);
-	uri += 8 + strlen(repo->host) + 1 + strlen(repo->module) + 1;
+	repo = repo_lookup(rsync, rt, uri, q, proc, &filename, &rtype);
+	if (repo == NULL || rtype != RTYPE_CER)
+		errx(1, "%d, %s: invalid file type", rtype, uri);
 
-	if (asprintf(&nfile, "%s/%s/%s", repo->host, repo->module, uri) == -1)
-		err(1, "asprintf");
-
-	entityq_add(proc, q, nfile, RTYPE_CER, repo, NULL, tal->pkey,
+	entityq_add(proc, q, filename, RTYPE_CER, repo, NULL, tal->pkey,
 	    tal->pkeysz, tal->descr, eid);
 }
 
@@ -570,24 +575,16 @@ static void
 queue_add_from_cert(int proc, int rsync, struct entityq *q,
     const char *uri, struct repotab *rt, size_t *eid)
 {
-	char			*nfile;
 	enum rtype		 type;
 	const struct repo	*repo;
-
-	if ((type = rtype_resolve(uri)) == RTYPE_EOF)
-		errx(1, "%s: unknown file type", uri);
-	if (type != RTYPE_MFT)
-		errx(1, "%s: invalid file type", uri);
+	const char		*filename;
 
 	/* Look up the repository. */
-
-	repo = repo_lookup(rsync, rt, uri, q, proc);
-	uri += 8 + strlen(repo->host) + 1 + strlen(repo->module) + 1;
-
-	if (asprintf(&nfile, "%s/%s/%s", repo->host, repo->module, uri) == -1)
-		err(1, "asprintf");
-
-	entityq_add(proc, q, nfile, type, repo, NULL, NULL, 0, NULL, eid);
+	repo = repo_lookup(rsync, rt, uri, q, proc, &filename,
+	    &type);
+	if (repo == NULL || type != RTYPE_MFT)
+		errx(1, "%d, %s: invalid file type %s", type, uri, repo ? "y": "NULL");
+	entityq_add(proc, q, filename, type, repo, NULL, NULL, 0, NULL, eid);
 }
 
 /*
@@ -1211,7 +1208,8 @@ entity_process(int proc, int rsync, struct stats *st,
 		mft = mft_read(proc);
 		if (mft->stale)
 			st->mfts_stale++;
-		queue_add_from_mft_set(proc, q, mft, eid);
+		queue_add_from_mft_set(proc, q, mft, eid,
+		    &rt->repos[ent->repo]);
 		mft_free(mft);
 		break;
 	case RTYPE_CRL:
@@ -1586,8 +1584,8 @@ main(int argc, char *argv[])
 			assert(i < rt.reposz);
 			assert(!rt.repos[i].loaded);
 			rt.repos[i].loaded = 1;
-			logx("%s/%s: pull done, cache up to date",
-			    rt.repos[i].host, rt.repos[i].module);
+			warnx("%s: pull done, cache up to date",
+			    rt.repos[i].fetch_info);
 			stats.repos++;
 			entityq_flush(proc, &q, &rt.repos[i]);
 		}
@@ -1666,6 +1664,8 @@ main(int argc, char *argv[])
 	for (i = 0; i < rt.reposz; i++) {
 		free(rt.repos[i].host);
 		free(rt.repos[i].module);
+		free(rt.repos[i].fetch_info);
+		free(rt.repos[i].dir);
 	}
 	free(rt.repos);
 

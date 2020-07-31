@@ -39,7 +39,8 @@
  * of which process maps to which request.
  */
 struct	rsyncproc {
-	char	*uri; /* uri of this rsync proc */
+	char	*fetch_info; /* uri of this rsync proc */
+	char	*dir; /* uri of this rsync proc */
 	size_t	 id; /* identity of request */
 	pid_t	 pid; /* pid of process or 0 if unassociated */
 };
@@ -57,7 +58,7 @@ rsync_uri_parse(const char **hostp, size_t *hostsz,
     const char **pathp, size_t *pathsz,
     enum rtype *rtypep, const char *uri)
 {
-	const char	*host, *module, *path;
+	const char	*host, *module, *path, *tmp;
 	size_t		 sz;
 
 	/* Initialise all output values to NULL or 0. */
@@ -84,6 +85,23 @@ rsync_uri_parse(const char **hostp, size_t *hostsz,
 		return 0;
 	}
 
+	/* do the type early in case of other early exits */
+	tmp = strrchr(uri, '.');
+	if (rtypep != NULL && tmp != NULL && strlen(tmp) == 4) {
+		if (strcasecmp(tmp, ".roa") == 0)
+			*rtypep = RTYPE_ROA;
+		else if (strcasecmp(tmp, ".mft") == 0)
+			*rtypep = RTYPE_MFT;
+		else if (strcasecmp(tmp, ".cer") == 0)
+			*rtypep = RTYPE_CER;
+		else if (strcasecmp(tmp, ".crl") == 0)
+			*rtypep = RTYPE_CRL;
+	}
+	if (*rtypep == RTYPE_EOF) {
+		warnx("%s: rsync link to an unknown type", uri);
+		return 0;
+	}
+
 	/* Parse the non-zero-length hostname. */
 
 	host = uri + 8;
@@ -102,51 +120,39 @@ rsync_uri_parse(const char **hostp, size_t *hostsz,
 		*hostsz = module - host;
 
 	/* The non-zero-length module follows the hostname. */
-
 	if (module[1] == '\0') {
 		warnx("%s: zero-length rsync module", uri);
 		return 0;
 	}
-
 	module++;
 
-	/* The path component is optional. */
-
+	/*
+	 * The path component is optional.
+	 * But if we dont get it then set it the same as module as we cant tell
+	 * which is missing
+	 */
 	if ((path = strchr(module, '/')) == NULL) {
-		assert(*module != '\0');
 		if (modulep != NULL)
 			*modulep = module;
 		if (modulesz != NULL)
 			*modulesz = strlen(module);
-		return 1;
+		path = module;
 	} else if (path == module) {
 		warnx("%s: zero-length module", uri);
 		return 0;
+	} else {
+		if (modulep != NULL)
+			*modulep = module;
+		if (modulesz != NULL)
+			*modulesz = path - module;
+		path++;
 	}
-
-	if (modulep != NULL)
-		*modulep = module;
-	if (modulesz != NULL)
-		*modulesz = path - module;
-
-	path++;
 	sz = strlen(path);
 
 	if (pathp != NULL)
 		*pathp = path;
 	if (pathsz != NULL)
 		*pathsz = sz;
-
-	if (rtypep != NULL && sz > 4) {
-		if (strcasecmp(path + sz - 4, ".roa") == 0)
-			*rtypep = RTYPE_ROA;
-		else if (strcasecmp(path + sz - 4, ".mft") == 0)
-			*rtypep = RTYPE_MFT;
-		else if (strcasecmp(path + sz - 4, ".cer") == 0)
-			*rtypep = RTYPE_CER;
-		else if (strcasecmp(path + sz - 4, ".crl") == 0)
-			*rtypep = RTYPE_CRL;
-	}
 
 	return 1;
 }
@@ -158,43 +164,18 @@ proc_child(int signal)
 	/* Nothing: just discard. */
 }
 
+
 /*
- * Process used for synchronising repositories.
- * This simply waits to be told which repository to synchronise, then
- * does so.
- * It then responds with the identifier of the repo that it updated.
- * It only exits cleanly when fd is closed.
- * FIXME: this should use buffered output to prevent deadlocks, but it's
- * very unlikely that we're going to fill our buffer, so whatever.
- * FIXME: limit the number of simultaneous process.
- * Currently, an attacker can trivially specify thousands of different
- * repositories and saturate our system.
+ * Unveil the command we want to run.
+ * If this has a pathname component in it, interpret as a file and unveil the
+ * file directly.
+ * Otherwise, look up the command in our PATH.
  */
-void
-proc_rsync(char *prog, char *bind_addr, int fd)
-{
-	size_t			 id, i, idsz = 0;
-	ssize_t			 ssz;
-	char			*host = NULL, *mod = NULL, *uri = NULL,
-				*dst = NULL, *path, *save, *cmd;
+static void
+xunveil_str(const char *prog) {
+	char 			*path, *save, *cmd;
 	const char		*pp;
-	pid_t			 pid;
-	char			*args[32];
-	int			 st, rc = 0;
 	struct stat		 stt;
-	struct pollfd		 pfd;
-	sigset_t		 mask, oldmask;
-	struct rsyncproc	*ids = NULL;
-
-	pfd.fd = fd;
-	pfd.events = POLLIN;
-
-	/*
-	 * Unveil the command we want to run.
-	 * If this has a pathname component in it, interpret as a file
-	 * and unveil the file directly.
-	 * Otherwise, look up the command in our PATH.
-	 */
 
 	if (strchr(prog, '/') == NULL) {
 		if (getenv("PATH") == NULL)
@@ -218,6 +199,39 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 		free(save);
 	} else if (unveil(prog, "x") == -1)
 		err(1, "%s: unveil", prog);
+}
+
+/*
+ * Process used for synchronising repositories.
+ * This simply waits to be told which repository to synchronise, then
+ * does so.
+ * It then responds with the identifier of the repo that it updated.
+ * It only exits cleanly when fd is closed.
+ * FIXME: this should use buffered output to prevent deadlocks, but it's
+ * very unlikely that we're going to fill our buffer, so whatever.
+ * FIXME: limit the number of simultaneous process.
+ * Currently, an attacker can trivially specify thousands of different
+ * repositories and saturate our system.
+ */
+void
+proc_rsync(char *prog, char *bind_addr, int fd)
+{
+	size_t			 id, i, idsz = 0;
+	ssize_t			 ssz;
+	char			*host = NULL, *mod = NULL, *dir = NULL,
+				*fetch_info = NULL,
+				*dir_split;
+	pid_t			 pid;
+	char			*args[32];
+	int			 st, rc = 0;
+	struct pollfd		 pfd;
+	sigset_t		 mask, oldmask;
+	struct rsyncproc	*ids = NULL;
+
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+
+	xunveil_str(prog);
 
 	/* Unveil the repository directory and terminate unveiling. */
 
@@ -257,15 +271,18 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 
 				if (!WIFEXITED(st)) {
 					warnx("rsync %s terminated abnormally",
-					    ids[i].uri);
+					    ids[i].fetch_info);
 					rc = 1;
 				} else if (WEXITSTATUS(st) != 0) {
-					warnx("rsync %s failed", ids[i].uri);
+					warnx("rsync %s failed",
+					      ids[i].fetch_info);
 				}
 
 				io_simple_write(fd, &ids[i].id, sizeof(size_t));
-				free(ids[i].uri);
-				ids[i].uri = NULL;
+				free(ids[i].fetch_info);
+				free(ids[i].dir);
+				ids[i].fetch_info = NULL;
+				ids[i].dir = NULL;
 				ids[i].pid = 0;
 				ids[i].id = 0;
 			}
@@ -286,6 +303,8 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 
 		/* Read host and module. */
 
+		io_str_read(fd, &dir);
+		io_str_read(fd, &fetch_info);
 		io_str_read(fd, &host);
 		io_str_read(fd, &mod);
 
@@ -295,16 +314,15 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 		 * will not build the destination for us.
 		 */
 
-		if (mkdir(host, 0700) == -1 && EEXIST != errno)
-			err(1, "%s", host);
-
-		if (asprintf(&dst, "%s/%s", host, mod) == -1)
-			err(1, NULL);
-		if (mkdir(dst, 0700) == -1 && EEXIST != errno)
-			err(1, "%s", dst);
-
-		if (asprintf(&uri, "rsync://%s/%s", host, mod) == -1)
-			err(1, NULL);
+		/* XXXNF this should use something like mkpath from rrdp */
+		dir_split = strrchr(dir, '/');
+		assert(dir_split != NULL);
+		dir_split[0] = '\0';
+		if (mkdir(dir, 0700) == -1 && EEXIST != errno)
+			err(1, "%s", dir);
+		dir_split[0] = '/';
+		if (mkdir(dir, 0700) == -1 && EEXIST != errno)
+			err(1, "%s", dir);
 
 		/* Run process itself, wait for exit, check error. */
 
@@ -321,8 +339,8 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 				args[i++] = "--address";
 				args[i++] = (char *)bind_addr;
 			}
-			args[i++] = uri;
-			args[i++] = dst;
+			args[i++] = fetch_info;
+			args[i++] = dir;
 			args[i] = NULL;
 			execvp(args[0], args);
 			err(1, "%s: execvp", prog);
@@ -342,12 +360,12 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 
 		ids[i].id = id;
 		ids[i].pid = pid;
-		ids[i].uri = uri;
+		ids[i].fetch_info = fetch_info;
+		ids[i].dir = dir;
 
 		/* Clean up temporary values. */
 
 		free(mod);
-		free(dst);
 		free(host);
 	}
 
@@ -355,7 +373,8 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 	for (i = 0; i < idsz; i++)
 		if (ids[i].pid > 0) {
 			kill(ids[i].pid, SIGTERM);
-			free(ids[i].uri);
+			free(ids[i].fetch_info);
+			free(ids[i].dir);
 		}
 
 	free(ids);

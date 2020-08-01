@@ -355,7 +355,7 @@ int		 as_check_covered(uint32_t, uint32_t,
 int		 rsync_uri_parse(const char **, size_t *,
 			const char **, size_t *, const char **, size_t *,
 			enum rtype *, const char *);
-void		 proc_rsync(char *, char *, int, int) __attribute__((noreturn));
+void		 proc_rsync(char *, char *, int) __attribute__((noreturn));
 
 /* Logging (though really used for OpenSSL errors). */
 

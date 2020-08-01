@@ -143,7 +143,8 @@ static void	build_crls(const struct auth *, struct crl_tree *,
 
 const char	*bird_tablename = "ROAS";
 
-int	 verbose;
+int	verbose;
+int	noop;
 
 struct stats	 stats;
 
@@ -301,7 +302,8 @@ entityq_flush(int fd, struct entityq *q, const struct repo *repo)
  * Look up a repository, queueing it for discovery if not found.
  */
 static const struct repo *
-repo_lookup(int fd, struct repotab *rt, const char *uri)
+repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
+    int proc)
 {
 	const char	*host, *mod;
 	size_t		 hostsz, modsz, i;
@@ -340,10 +342,17 @@ repo_lookup(int fd, struct repotab *rt, const char *uri)
 
 	i = rt->reposz - 1;
 
-	logx("%s/%s: pulling from network", rp->host, rp->module);
-	io_simple_write(fd, &i, sizeof(size_t));
-	io_str_write(fd, rp->host);
-	io_str_write(fd, rp->module);
+	if (!noop) {
+		logx("%s/%s: pulling from network", rp->host, rp->module);
+		io_simple_write(fd, &i, sizeof(size_t));
+		io_str_write(fd, rp->host);
+		io_str_write(fd, rp->module);
+	} else {
+		rp->loaded = 1;
+		logx("%s/%s: loaded from cache", rp->host, rp->module);
+		stats.repos++;
+		entityq_flush(proc, q, rp);
+	}
 	return rp;
 }
 
@@ -544,7 +553,7 @@ queue_add_from_tal(int proc, int rsync, struct entityq *q,
 	/* Look up the repository. */
 
 	assert(rtype_resolve(uri) == RTYPE_CER);
-	repo = repo_lookup(rsync, rt, uri);
+	repo = repo_lookup(rsync, rt, uri, q, proc);
 	uri += 8 + strlen(repo->host) + 1 + strlen(repo->module) + 1;
 
 	if (asprintf(&nfile, "%s/%s/%s", repo->host, repo->module, uri) == -1)
@@ -572,7 +581,7 @@ queue_add_from_cert(int proc, int rsync, struct entityq *q,
 
 	/* Look up the repository. */
 
-	repo = repo_lookup(rsync, rt, uri);
+	repo = repo_lookup(rsync, rt, uri, q, proc);
 	uri += 8 + strlen(repo->host) + 1 + strlen(repo->module) + 1;
 
 	if (asprintf(&nfile, "%s/%s/%s", repo->host, repo->module, uri) == -1)
@@ -1345,7 +1354,7 @@ int
 main(int argc, char *argv[])
 {
 	int		 rc = 1, c, proc, st, rsync,
-			 fl = SOCK_STREAM | SOCK_CLOEXEC, noop = 0;
+			 fl = SOCK_STREAM | SOCK_CLOEXEC;
 	size_t		 i, j, eid = 1, outsz = 0, talsz = 0;
 	pid_t		 procpid, rsyncpid;
 	int		 fd[2];
@@ -1489,32 +1498,32 @@ main(int argc, char *argv[])
 	 * TAL) exists and has been downloaded.
 	 */
 
-	if (socketpair(AF_UNIX, fl, 0, fd) == -1)
-		err(1, "socketpair");
-	if ((rsyncpid = fork()) == -1)
-		err(1, "fork");
+	if (!noop) {
+		if (socketpair(AF_UNIX, fl, 0, fd) == -1)
+			err(1, "socketpair");
+		if ((rsyncpid = fork()) == -1)
+			err(1, "fork");
 
-	if (rsyncpid == 0) {
-		close(proc);
-		close(fd[1]);
+		if (rsyncpid == 0) {
+			close(proc);
+			close(fd[1]);
 
-		/* change working directory to the cache directory */
-		if (chdir(cachedir) == -1)
-			err(1, "%s: chdir", cachedir);
+			/* change working directory to the cache directory */
+			if (chdir(cachedir) == -1)
+				err(1, "%s: chdir", cachedir);
 
-		if (pledge("stdio rpath cpath proc exec unveil", NULL) == -1)
-			err(1, "pledge");
+			if (pledge("stdio rpath cpath proc exec unveil", NULL)
+			    == -1)
+				err(1, "pledge");
 
-		/* If -n, we don't exec or mkdir. */
+			proc_rsync(rsync_prog, bind_addr, fd[0]);
+			/* NOTREACHED */
+		}
 
-		if (noop && pledge("stdio", NULL) == -1)
-			err(1, "pledge");
-		proc_rsync(rsync_prog, bind_addr, fd[0], noop);
-		/* NOTREACHED */
-	}
-
-	close(fd[0]);
-	rsync = fd[1];
+		close(fd[0]);
+		rsync = fd[1];
+	} else
+		rsync = -1;
 
 	assert(rsync != proc);
 
@@ -1617,13 +1626,14 @@ main(int argc, char *argv[])
 		warnx("parser process exited abnormally");
 		rc = 1;
 	}
-	if (waitpid(rsyncpid, &st, 0) == -1)
-		err(1, "waitpid");
-	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
-		warnx("rsync process exited abnormally");
-		rc = 1;
+	if (!noop) {
+		if (waitpid(rsyncpid, &st, 0) == -1)
+			err(1, "waitpid");
+		if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+			warnx("rsync process exited abnormally");
+			rc = 1;
+		}
 	}
-
 	gettimeofday(&now_time, NULL);
 	timersub(&now_time, &start_time, &stats.elapsed_time);
 	if (getrusage(RUSAGE_SELF, &ru) == 0) {

@@ -171,7 +171,7 @@ proc_child(int signal)
  * repositories and saturate our system.
  */
 void
-proc_rsync(char *prog, char *bind_addr, int fd, int noop)
+proc_rsync(char *prog, char *bind_addr, int fd)
 {
 	size_t			 id, i, idsz = 0;
 	ssize_t			 ssz;
@@ -196,37 +196,35 @@ proc_rsync(char *prog, char *bind_addr, int fd, int noop)
 	 * Otherwise, look up the command in our PATH.
 	 */
 
-	if (!noop) {
-		if (strchr(prog, '/') == NULL) {
-			if (getenv("PATH") == NULL)
-				errx(1, "PATH is unset");
-			if ((path = strdup(getenv("PATH"))) == NULL)
-				err(1, "strdup");
-			save = path;
-			while ((pp = strsep(&path, ":")) != NULL) {
-				if (*pp == '\0')
-					continue;
-				if (asprintf(&cmd, "%s/%s", pp, prog) == -1)
-					err(1, "asprintf");
-				if (lstat(cmd, &stt) == -1) {
-					free(cmd);
-					continue;
-				} else if (unveil(cmd, "x") == -1)
-					err(1, "%s: unveil", cmd);
+	if (strchr(prog, '/') == NULL) {
+		if (getenv("PATH") == NULL)
+			errx(1, "PATH is unset");
+		if ((path = strdup(getenv("PATH"))) == NULL)
+			err(1, "strdup");
+		save = path;
+		while ((pp = strsep(&path, ":")) != NULL) {
+			if (*pp == '\0')
+				continue;
+			if (asprintf(&cmd, "%s/%s", pp, prog) == -1)
+				err(1, "asprintf");
+			if (lstat(cmd, &stt) == -1) {
 				free(cmd);
-				break;
-			}
-			free(save);
-		} else if (unveil(prog, "x") == -1)
-			err(1, "%s: unveil", prog);
+				continue;
+			} else if (unveil(cmd, "x") == -1)
+				err(1, "%s: unveil", cmd);
+			free(cmd);
+			break;
+		}
+		free(save);
+	} else if (unveil(prog, "x") == -1)
+		err(1, "%s: unveil", prog);
 
-		/* Unveil the repository directory and terminate unveiling. */
+	/* Unveil the repository directory and terminate unveiling. */
 
-		if (unveil(".", "c") == -1)
-			err(1, "unveil");
-		if (unveil(NULL, NULL) == -1)
-			err(1, "unveil");
-	}
+	if (unveil(".", "c") == -1)
+		err(1, "unveil");
+	if (unveil(NULL, NULL) == -1)
+		err(1, "unveil");
 
 	/* Initialise retriever for children exiting. */
 
@@ -291,12 +289,6 @@ proc_rsync(char *prog, char *bind_addr, int fd, int noop)
 		io_str_read(fd, &host);
 		io_str_read(fd, &mod);
 
-		if (noop) {
-			io_simple_write(fd, &id, sizeof(size_t));
-			free(host);
-			free(mod);
-			continue;
-		}
 		/*
 		 * Create source and destination locations.
 		 * Build up the tree to this point because GPL rsync(1)
@@ -369,3 +361,4 @@ proc_rsync(char *prog, char *bind_addr, int fd, int noop)
 	free(ids);
 	exit(rc);
 }
+

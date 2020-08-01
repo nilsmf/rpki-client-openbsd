@@ -20,6 +20,11 @@
 #include <sys/tree.h>
 #include <sys/time.h>
 
+enum repo_type {
+	REPO_TYPE_RSYNC,
+	REPO_TYPE_RRDP
+};
+
 enum cert_as_type {
 	CERT_AS_ID, /* single identifier */
 	CERT_AS_INHERIT, /* inherit from parent */
@@ -243,7 +248,8 @@ enum rtype {
 	RTYPE_MFT,
 	RTYPE_ROA,
 	RTYPE_CER,
-	RTYPE_CRL
+	RTYPE_CRL,
+	RTYPE_XML
 };
 
 /*
@@ -355,7 +361,8 @@ int		 as_check_covered(uint32_t, uint32_t,
 int		 rsync_uri_parse(const char **, size_t *,
 			const char **, size_t *, const char **, size_t *,
 			enum rtype *, const char *);
-void		 proc_rsync(char *, char *, int) __attribute__((noreturn));
+void		 proc_rsync(char *, char *, char *,
+			int) __attribute__((noreturn));
 
 /* Logging (though really used for OpenSSL errors). */
 

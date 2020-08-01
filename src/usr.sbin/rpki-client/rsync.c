@@ -61,6 +61,7 @@ rsync_uri_parse(const char **hostp, size_t *hostsz,
 {
 	const char	*host, *module, *path, *tmp;
 	size_t		 sz;
+	enum repo_type	 type;
 
 	/* Initialise all output values to NULL or 0. */
 
@@ -81,8 +82,12 @@ rsync_uri_parse(const char **hostp, size_t *hostsz,
 
 	/* Case-insensitive rsync URI. */
 
-	if (strncasecmp(uri, "rsync://", 8)) {
-		warnx("%s: not using rsync schema", uri);
+	if (strncasecmp(uri, "rsync://", 8) == 0)
+		type = REPO_TYPE_RSYNC;
+	else if (strncasecmp(uri, "https://", 8) == 0)
+		type = REPO_TYPE_RRDP;
+	else {
+		warnx("%s: not using rsync or https schema", uri);
 		return 0;
 	}
 
@@ -97,10 +102,14 @@ rsync_uri_parse(const char **hostp, size_t *hostsz,
 			*rtypep = RTYPE_CER;
 		else if (strcasecmp(tmp, ".crl") == 0)
 			*rtypep = RTYPE_CRL;
+		else if (strcasecmp(tmp, ".xml") == 0)
+			*rtypep = RTYPE_XML;
 	}
-	if (*rtypep == RTYPE_EOF) {
-		warnx("%s: rsync link to an unknown type", uri);
+	if (type == REPO_TYPE_RRDP && *rtypep != RTYPE_XML) {
+		warnx("%s: https link not an rrdp xml", uri);
 		return 0;
+	} else if (type == REPO_TYPE_RSYNC && *rtypep == RTYPE_XML) {
+		warnx("%s: rsync link to an xml", uri);
 	}
 
 	/* Parse the non-zero-length hostname. */
@@ -215,13 +224,14 @@ xunveil_str(const char *prog) {
  * repositories and saturate our system.
  */
 void
-proc_rsync(char *prog, char *bind_addr, int fd)
+proc_rsync(char *prog, char *rrdp_prog, char *bind_addr, int fd)
 {
 	size_t			 id, i, idsz = 0;
 	ssize_t			 ssz;
 	char			*dir = NULL,
 				*remote_loc = NULL, *local_loc = NULL,
 				*dir_split;
+	enum repo_type		 type;
 	pid_t			 pid;
 	char			*args[32];
 	int			 st, rc = 0;
@@ -233,6 +243,7 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 	pfd.events = POLLIN;
 
 	xunveil_str(prog);
+	xunveil_str(rrdp_prog);
 
 	/* Unveil the repository directory and terminate unveiling. */
 
@@ -306,6 +317,7 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 
 		/* Read fetch information */
 
+		read(fd, &type, sizeof(enum repo_type));
 		io_str_read(fd, &dir);
 		io_str_read(fd, &remote_loc);
 		io_str_read(fd, &local_loc);
@@ -328,7 +340,6 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 			err(1, "%s", dir);
 
 		/* Run process itself, wait for exit, check error. */
-
 		if ((pid = fork()) == -1)
 			err(1, "fork");
 
@@ -336,17 +347,27 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 			if (pledge("stdio exec", NULL) == -1)
 				err(1, "pledge");
 			i = 0;
-			args[i++] = (char *)prog;
-			args[i++] = "-rt";
-			if (bind_addr != NULL) {
-				args[i++] = "--address";
-				args[i++] = (char *)bind_addr;
+			if (type == REPO_TYPE_RSYNC) {
+				args[i++] = (char *)prog;
+				args[i++] = "-rt";
+				if (bind_addr != NULL) {
+					args[i++] = "--address";
+					args[i++] = (char *)bind_addr;
+				}
+				args[i++] = remote_loc;
+				args[i++] = local_loc;
+				args[i] = NULL;
+				execvp(args[0], args);
+				err(1, "%s: execvp", prog);
+			} else if (type == REPO_TYPE_RRDP) {
+				args[i++] = (char *)rrdp_prog;
+				args[i++] = "-d";
+				args[i++] = local_loc;
+				args[i++] = remote_loc;
+				args[i++] = NULL;
+				execvp(args[0], args);
+				err(1, "%s: execvp", rrdp_prog);
 			}
-			args[i++] = remote_loc;
-			args[i++] = local_loc;
-			args[i] = NULL;
-			execvp(args[0], args);
-			err(1, "%s: execvp", prog);
 		}
 
 		/* Augment the list of running processes. */

@@ -86,6 +86,7 @@ struct	repo {
 	char		*host; /* used for finding existing */
 	char		*module; /* used for finding existing */
 	int		 loaded; /* whether loaded or not */
+	enum repo_type	 type; /* RRDP or rsync */
 	size_t		 id; /* identifier (array index) */
 };
 
@@ -289,16 +290,76 @@ entityq_flush(int fd, struct entityq *q, const struct repo *repo)
 }
 
 /*
+ * The inner workings of entityq_switch_repo
+ */
+static void
+entityq_switch_repo_inner(struct entityq *q, struct repotab *rt,
+    ssize_t *rtindexbuff, size_t rtindexbuffsz, size_t switch_index)
+{
+	struct entity	*p;
+	size_t i, count = 0;
+
+	TAILQ_FOREACH(p, q, entries) {
+		if (rt->repos[p->repo].type == REPO_TYPE_RSYNC) {
+			for (i = 0; i < rtindexbuffsz; i++) {
+				if (p->repo == rtindexbuff[i]) {
+					p->repo = switch_index;
+					count++;
+				}
+			}
+		}
+	}
+	warnx("migrated %lu repos %lu references into %s",
+	    rtindexbuffsz, count, rt->repos[switch_index].remote_loc);
+}
+
+/*
+ * Scan through all queued requests and see which ones are assigned rsync repos
+ * for our rrdp repo and switch them over
+ * Done as a buffer of repos because #repos <= #entities so reducing strcmp
+ */
+static void
+entityq_switch_repo(struct entityq *q, struct repotab *rt, struct repo *rp,
+    size_t switch_index)
+{
+	size_t i, rtindexbuffsz = 0;
+	ssize_t rtindexbuff[50];
+	struct repo *switch_repo = &rt->repos[switch_index];
+
+	/* make a reference of up to 50 matching repos */
+	for (i = 0; i < rt->reposz; i++) {
+		if (rt->repos[i].type == REPO_TYPE_RSYNC &&
+		    strlen(rt->repos[i].host) == strlen(switch_repo->host) &&
+		    strcmp(rt->repos[i].host, switch_repo->host) == 0) {
+			rtindexbuff[rtindexbuffsz++] = i;
+		}
+		/* check and then reset the buffer */
+		if (rtindexbuffsz >= 50) {
+			entityq_switch_repo_inner(q, rt, rtindexbuff,
+			    rtindexbuffsz, switch_index);
+			rtindexbuffsz = 0;
+		}
+	}
+	/* check the buffer */
+	entityq_switch_repo_inner(q, rt, rtindexbuff, rtindexbuffsz,
+	    switch_index);
+}
+/*
  * Look up a repository, queueing it for discovery if not found.
+ * Much more complicated with dual repositories of rrdp and rsync.
+ * We prefer rrdp repos and once we build one we will update all existing
+ * entries to point to our rrdp repo.
  */
 static const struct repo *
 repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
-    int proc, const char **filename, enum rtype *file_type)
+    int proc, char *parent_host, const char **filename, enum rtype *file_type)
 {
 	const char	*host, *mod, *path;
-	size_t		 hostsz, modsz, pathsz, i;
+	size_t		 hostsz, modsz, pathsz, i, best_repo_i;
 	struct repo	*rp;
+	enum repo_type	 repo_type;
 
+	assert(filename != NULL);
 	if (rsync_uri_parse(&host, &hostsz, &mod, &modsz,
 	    &path, &pathsz, file_type, uri) == 0 || *file_type == RTYPE_EOF) {
 		warnx("url parse failed");
@@ -306,18 +367,51 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 	}
 
 	*filename = mod;
-	/* Look up in repository table. */
-
+	if (*file_type == RTYPE_XML) {
+		repo_type = REPO_TYPE_RRDP;
+		/*
+		 * A little bit of reshuffling since rrdp cares about its parent
+		 * but not about the module
+		 */
+		mod = host;
+		modsz = hostsz;
+		host = parent_host;
+		hostsz = strlen(host);
+	} else {
+		repo_type = REPO_TYPE_RSYNC;
+	}
+	/*
+	 * Look up in repository table.
+	 * Looser condition on RRDP repos (they cover more data)
+	 * and prefer them over rsync
+	 */
+	best_repo_i = rt->reposz;
 	for (i = 0; i < rt->reposz; i++) {
 		if (strlen(rt->repos[i].host) != hostsz)
 			continue;
-		if (strlen(rt->repos[i].module) != modsz)
+		if (strncasecmp(rt->repos[i].host, host, hostsz) != 0)
 			continue;
-		if (strncasecmp(rt->repos[i].host, host, hostsz))
+		/* rsync uris only need to match host of rrdp */
+		if (rt->repos[i].type == REPO_TYPE_RRDP &&
+		    repo_type == REPO_TYPE_RSYNC) {
+			best_repo_i = i;
+			break;
+		}
+
+		if (strlen(rt->repos[i].module) != modsz)
 			continue;
 		if (strncasecmp(rt->repos[i].module, mod, modsz))
 			continue;
-		return &rt->repos[i];
+		/* rrdp should never find an rsync module */
+		if (repo_type != rt->repos[i].type)
+			continue;
+		best_repo_i = i;
+		/* if rrdp found an rrdp module then we're done */
+		if (rt->repos[i].type == REPO_TYPE_RRDP)
+			break;
+	}
+	if (best_repo_i < rt->reposz) {
+		return &rt->repos[best_repo_i];
 	}
 
 	/* We didn't find the repo already so lets create it */
@@ -330,24 +424,43 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 	rp = &rt->repos[rt->reposz++];
 	memset(rp, 0, sizeof(struct repo));
 	rp->id = rt->reposz - 1;
+	rp->type = repo_type;
 
 	if ((rp->host = strndup(host, hostsz)) == NULL)
 		err(1, "strndup");
 	if ((rp->module = strndup(mod, modsz)) == NULL)
 		err(1, "strndup");
-	if ((rp->dir = strndup(host, hostsz)) == NULL)
-		err(1, "strndup");
-	if (asprintf(&rp->remote_loc, "rsync://%s/%s",
-	    rp->host, rp->module) == -1)
-		err(1, "asprintf");
-	if (asprintf(&rp->local_loc, "%s/%s", rp->host, rp->module) == -1)
-		err(1, "asprintf");
+	if (rp->type == REPO_TYPE_RRDP) {
+		if (asprintf(&rp->dir, "rrdp/%.*s", (int)modsz, mod) == -1)
+			err(1, "asprintf");
+		if ((rp->remote_loc = strdup(uri)) == NULL)
+			err(1, "strdup");
+		if ((rp->local_loc = strdup(rp->dir)) == NULL)
+			err(1, "strdup");
+	} else {
+		if ((rp->dir = strndup(host, hostsz)) == NULL)
+			err(1, "strndup");
+		if (asprintf(&rp->remote_loc, "rsync://%s/%s",
+		    rp->host, rp->module) == -1)
+			err(1, "asprintf");
+		if (asprintf(&rp->local_loc, "%s/%s", rp->host,
+			     rp->module) == -1)
+			err(1, "asprintf");
+	}
 
 	i = rt->reposz - 1;
+
+	/*
+	 * XXXNF any race conditions with entities cued up for process?
+	 * make all existing entityq entries with rsync point to our repo now
+	 */
+	if (rp->type == REPO_TYPE_RRDP)
+		entityq_switch_repo(q, rt, rp, i);
 
 	if (!noop) {
 		logx("pulling from network: %s", rp->remote_loc);
 		io_simple_write(fd, &i, sizeof(size_t));
+		io_simple_write(fd, &rp->type, sizeof(enum repo_type));
 		io_str_write(fd, rp->dir);
 		io_str_write(fd, rp->remote_loc);
 		io_str_write(fd, rp->local_loc);
@@ -562,7 +675,7 @@ queue_add_from_tal(int proc, int rsync, struct entityq *q,
 
 	/* Look up the repository. */
 
-	repo = repo_lookup(rsync, rt, uri, q, proc, &filename, &rtype);
+	repo = repo_lookup(rsync, rt, uri, q, proc, NULL, &filename, &rtype);
 	if (repo == NULL || rtype != RTYPE_CER)
 		errx(1, "%d, %s: invalid file type", rtype, uri);
 
@@ -575,16 +688,16 @@ queue_add_from_tal(int proc, int rsync, struct entityq *q,
  */
 static void
 queue_add_from_cert(int proc, int rsync, struct entityq *q,
-    const char *uri, struct repotab *rt, size_t *eid)
+    const char *uri, struct repotab *rt, size_t *eid, char *parent_host)
 {
 	enum rtype		 type;
 	const struct repo	*repo;
 	const char		*filename;
 
 	/* Look up the repository. */
-	repo = repo_lookup(rsync, rt, uri, q, proc, &filename,
+	repo = repo_lookup(rsync, rt, uri, q, proc, parent_host, &filename,
 	    &type);
-	if (repo == NULL || type != RTYPE_MFT)
+	if (repo == NULL || (type != RTYPE_MFT && type != RTYPE_XML))
 		errx(1, "%d, %s: invalid file type %s", type, uri, repo ? "y": "NULL");
 	entityq_add(proc, q, filename, type, repo, NULL, NULL, 0, NULL, eid);
 }
@@ -1078,6 +1191,9 @@ proc_parser(int fd)
 		entity_buffer_resp(&b, &bsz, &bmax, entp);
 
 		switch (entp->type) {
+		case RTYPE_XML:
+			/* Do Nothing we parse the xml files as part of rrdp */
+			break;
 		case RTYPE_TAL:
 			assert(!entp->has_dgst);
 			if ((tal = tal_parse(entp->uri, entp->descr)) == NULL)
@@ -1172,6 +1288,9 @@ entity_process(int proc, int rsync, struct stats *st,
 	 */
 
 	switch (ent->type) {
+	case RTYPE_XML:
+		/* Do Nothing we parse the xml files as part of rrdp */
+		break;
 	case RTYPE_TAL:
 		st->tals++;
 		tal = tal_read(proc);
@@ -1193,9 +1312,18 @@ entity_process(int proc, int rsync, struct stats *st,
 			 * we're revoked and then we don't want to
 			 * process the MFT.
 			 */
-			if (cert->mft != NULL)
-				queue_add_from_cert(proc, rsync,
-				    q, cert->mft, rt, eid);
+			if (cert->notify != NULL && *cert->notify != '\0') {
+				queue_add_from_cert(proc, rsync, q,
+				    cert->notify, rt, eid,
+				    rt->repos[ent->repo].host);
+			}
+
+			if (cert->mft != NULL && *cert->mft != '\0') {
+				queue_add_from_cert(proc, rsync, q,
+				    cert->mft, rt, eid,
+				    rt->repos[ent->repo].host);
+			}
+
 		} else
 			st->certs_invalid++;
 		cert_free(cert);
@@ -1296,9 +1424,12 @@ repo_cleanup(const char *cachedir, struct repotab *rt)
 		err(1, "%s: chdir", cachedir);
 
 	for (i = 0; i < rt->reposz; i++) {
-		if (asprintf(&argv[0], "%s/%s", rt->repos[i].host,
-		    rt->repos[i].module) == -1)
-			err(1, NULL);
+		/*
+		 * Don't cleanup rrdp directories
+		 */
+		if (rt->repos[i].type == REPO_TYPE_RRDP)
+			continue;
+		argv[0] = rt->repos[i].dir;
 		argv[1] = NULL;
 		if ((fts = fts_open(argv, FTS_PHYSICAL | FTS_NOSTAT,
 		    NULL)) == NULL)
@@ -1364,6 +1495,7 @@ main(int argc, char *argv[])
 	struct repotab	 rt;
 	struct roa	**out = NULL;
 	char		*rsync_prog = "openrsync";
+	char		*rrdp_prog = "rrdp";
 	char		*bind_addr = NULL;
 	const char	*cachedir = NULL;
 	const char	*tals[TALSZ_MAX];
@@ -1392,7 +1524,7 @@ main(int argc, char *argv[])
 	if (pledge("stdio rpath wpath cpath fattr proc exec unveil", NULL) == -1)
 		err(1, "pledge");
 
-	while ((c = getopt(argc, argv, "b:Bcd:e:jnot:T:v")) != -1)
+	while ((c = getopt(argc, argv, "b:Bcd:e:jnor:t:T:v")) != -1)
 		switch (c) {
 		case 'b':
 			bind_addr = optarg;
@@ -1417,6 +1549,9 @@ main(int argc, char *argv[])
 			break;
 		case 'o':
 			outformats |= FORMAT_OPENBGPD;
+			break;
+		case 'r':
+			rrdp_prog = optarg;
 			break;
 		case 't':
 			if (talsz >= TALSZ_MAX)
@@ -1516,7 +1651,7 @@ main(int argc, char *argv[])
 			    == -1)
 				err(1, "pledge");
 
-			proc_rsync(rsync_prog, bind_addr, fd[0]);
+			proc_rsync(rsync_prog, rrdp_prog, bind_addr, fd[0]);
 			/* NOTREACHED */
 		}
 
@@ -1681,7 +1816,7 @@ main(int argc, char *argv[])
 usage:
 	fprintf(stderr,
 	    "usage: rpki-client [-Bcjnov] [-b sourceaddr] [-d cachedir]"
-	    " [-e rsync_prog]\n"
+	    " [-e rsync_prog] [-r rrdp_prog]\n"
 	    "                   [-T table] [-t tal] [outputdir]\n");
 	return 1;
 }

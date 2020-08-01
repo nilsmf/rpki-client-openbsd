@@ -59,7 +59,6 @@
 #include <inttypes.h>
 #include <poll.h>
 #include <pwd.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,17 +84,6 @@ struct	repo {
 	char	*module; /* module name */
 	int	 loaded; /* whether loaded or not */
 	size_t	 id; /* identifier (array index) */
-};
-
-/*
- * A running rsync process.
- * We can have multiple of these simultaneously and need to keep track
- * of which process maps to which request.
- */
-struct	rsyncproc {
-	char	*uri; /* uri of this rsync proc */
-	size_t	 id; /* identity of request */
-	pid_t	 pid; /* pid of process or 0 if unassociated */
 };
 
 /*
@@ -149,8 +137,6 @@ struct filepath_tree  fpt = RB_INITIALIZER(&fpt);
  * Mark that our subprocesses will never return.
  */
 static void	proc_parser(int) __attribute__((noreturn));
-static void	proc_rsync(char *, char *, int, int)
-		    __attribute__((noreturn));
 static void	build_chain(const struct auth *, STACK_OF(X509) **);
 static void	build_crls(const struct auth *, struct crl_tree *,
 		    STACK_OF(X509_CRL) **);
@@ -258,6 +244,60 @@ entity_read_req(int fd, struct entity *ent)
 }
 
 /*
+ * Like entity_write_req() but into a buffer.
+ * Matched by entity_read_req().
+ */
+static void
+entity_buffer_req(char **b, size_t *bsz, size_t *bmax,
+    const struct entity *ent)
+{
+
+	io_simple_buffer(b, bsz, bmax, &ent->id, sizeof(size_t));
+	io_simple_buffer(b, bsz, bmax, &ent->type, sizeof(enum rtype));
+	io_str_buffer(b, bsz, bmax, ent->uri);
+	io_simple_buffer(b, bsz, bmax, &ent->has_dgst, sizeof(int));
+	if (ent->has_dgst)
+		io_simple_buffer(b, bsz, bmax, ent->dgst, sizeof(ent->dgst));
+	io_simple_buffer(b, bsz, bmax, &ent->has_pkey, sizeof(int));
+	if (ent->has_pkey)
+		io_buf_buffer(b, bsz, bmax, ent->pkey, ent->pkeysz);
+	io_simple_buffer(b, bsz, bmax, &ent->has_descr, sizeof(int));
+	if (ent->has_descr)
+		io_str_buffer(b, bsz, bmax, ent->descr);
+}
+
+/*
+ * Write the queue entity.
+ * Simply a wrapper around entity_buffer_req().
+ */
+static void
+entity_write_req(int fd, const struct entity *ent)
+{
+	char	*b = NULL;
+	size_t	 bsz = 0, bmax = 0;
+
+	entity_buffer_req(&b, &bsz, &bmax, ent);
+	io_simple_write(fd, b, bsz);
+	free(b);
+}
+
+/*
+ * Scan through all queued requests and see which ones are in the given
+ * repo, then flush those into the parser process.
+ */
+static void
+entityq_flush(int fd, struct entityq *q, const struct repo *repo)
+{
+	struct entity	*p;
+
+	TAILQ_FOREACH(p, q, entries) {
+		if (p->repo < 0 || repo->id != (size_t)p->repo)
+			continue;
+		entity_write_req(fd, p);
+	}
+}
+
+/*
  * Look up a repository, queueing it for discovery if not found.
  */
 static const struct repo *
@@ -335,60 +375,6 @@ entity_buffer_resp(char **b, size_t *bsz, size_t *bmax,
 {
 
 	io_simple_buffer(b, bsz, bmax, &ent->id, sizeof(size_t));
-}
-
-/*
- * Like entity_write_req() but into a buffer.
- * Matched by entity_read_req().
- */
-static void
-entity_buffer_req(char **b, size_t *bsz, size_t *bmax,
-    const struct entity *ent)
-{
-
-	io_simple_buffer(b, bsz, bmax, &ent->id, sizeof(size_t));
-	io_simple_buffer(b, bsz, bmax, &ent->type, sizeof(enum rtype));
-	io_str_buffer(b, bsz, bmax, ent->uri);
-	io_simple_buffer(b, bsz, bmax, &ent->has_dgst, sizeof(int));
-	if (ent->has_dgst)
-		io_simple_buffer(b, bsz, bmax, ent->dgst, sizeof(ent->dgst));
-	io_simple_buffer(b, bsz, bmax, &ent->has_pkey, sizeof(int));
-	if (ent->has_pkey)
-		io_buf_buffer(b, bsz, bmax, ent->pkey, ent->pkeysz);
-	io_simple_buffer(b, bsz, bmax, &ent->has_descr, sizeof(int));
-	if (ent->has_descr)
-		io_str_buffer(b, bsz, bmax, ent->descr);
-}
-
-/*
- * Write the queue entity.
- * Simply a wrapper around entity_buffer_req().
- */
-static void
-entity_write_req(int fd, const struct entity *ent)
-{
-	char	*b = NULL;
-	size_t	 bsz = 0, bmax = 0;
-
-	entity_buffer_req(&b, &bsz, &bmax, ent);
-	io_simple_write(fd, b, bsz);
-	free(b);
-}
-
-/*
- * Scan through all queued requests and see which ones are in the given
- * repo, then flush those into the parser process.
- */
-static void
-entityq_flush(int fd, struct entityq *q, const struct repo *repo)
-{
-	struct entity	*p;
-
-	TAILQ_FOREACH(p, q, entries) {
-		if (p->repo < 0 || repo->id != (size_t)p->repo)
-			continue;
-		entity_write_req(fd, p);
-	}
 }
 
 /*
@@ -581,12 +567,8 @@ queue_add_from_cert(int proc, int rsync, struct entityq *q,
 
 	if ((type = rtype_resolve(uri)) == RTYPE_EOF)
 		errx(1, "%s: unknown file type", uri);
-	if (type != RTYPE_MFT && type != RTYPE_CRL)
+	if (type != RTYPE_MFT)
 		errx(1, "%s: invalid file type", uri);
-
-	/* ignore the CRL since it is already loaded via the MFT */
-	if (type == RTYPE_CRL)
-		return;
 
 	/* Look up the repository. */
 
@@ -597,227 +579,6 @@ queue_add_from_cert(int proc, int rsync, struct entityq *q,
 		err(1, "asprintf");
 
 	entityq_add(proc, q, nfile, type, repo, NULL, NULL, 0, NULL, eid);
-}
-
-static void
-proc_child(int signal)
-{
-
-	/* Nothing: just discard. */
-}
-
-/*
- * Process used for synchronising repositories.
- * This simply waits to be told which repository to synchronise, then
- * does so.
- * It then responds with the identifier of the repo that it updated.
- * It only exits cleanly when fd is closed.
- * FIXME: this should use buffered output to prevent deadlocks, but it's
- * very unlikely that we're going to fill our buffer, so whatever.
- * FIXME: limit the number of simultaneous process.
- * Currently, an attacker can trivially specify thousands of different
- * repositories and saturate our system.
- */
-static void
-proc_rsync(char *prog, char *bind_addr, int fd, int noop)
-{
-	size_t			 id, i, idsz = 0;
-	ssize_t			 ssz;
-	char			*host = NULL, *mod = NULL, *uri = NULL,
-				*dst = NULL, *path, *save, *cmd;
-	const char		*pp;
-	pid_t			 pid;
-	char			*args[32];
-	int			 st, rc = 0;
-	struct stat		 stt;
-	struct pollfd		 pfd;
-	sigset_t		 mask, oldmask;
-	struct rsyncproc	*ids = NULL;
-
-	pfd.fd = fd;
-	pfd.events = POLLIN;
-
-	/*
-	 * Unveil the command we want to run.
-	 * If this has a pathname component in it, interpret as a file
-	 * and unveil the file directly.
-	 * Otherwise, look up the command in our PATH.
-	 */
-
-	if (!noop) {
-		if (strchr(prog, '/') == NULL) {
-			if (getenv("PATH") == NULL)
-				errx(1, "PATH is unset");
-			if ((path = strdup(getenv("PATH"))) == NULL)
-				err(1, "strdup");
-			save = path;
-			while ((pp = strsep(&path, ":")) != NULL) {
-				if (*pp == '\0')
-					continue;
-				if (asprintf(&cmd, "%s/%s", pp, prog) == -1)
-					err(1, "asprintf");
-				if (lstat(cmd, &stt) == -1) {
-					free(cmd);
-					continue;
-				} else if (unveil(cmd, "x") == -1)
-					err(1, "%s: unveil", cmd);
-				free(cmd);
-				break;
-			}
-			free(save);
-		} else if (unveil(prog, "x") == -1)
-			err(1, "%s: unveil", prog);
-
-		/* Unveil the repository directory and terminate unveiling. */
-
-		if (unveil(".", "c") == -1)
-			err(1, "unveil");
-		if (unveil(NULL, NULL) == -1)
-			err(1, "unveil");
-	}
-
-	/* Initialise retriever for children exiting. */
-
-	if (sigemptyset(&mask) == -1)
-		err(1, NULL);
-	if (signal(SIGCHLD, proc_child) == SIG_ERR)
-		err(1, NULL);
-	if (sigaddset(&mask, SIGCHLD) == -1)
-		err(1, NULL);
-	if (sigprocmask(SIG_BLOCK, &mask, &oldmask) == -1)
-		err(1, NULL);
-
-	for (;;) {
-		if (ppoll(&pfd, 1, NULL, &oldmask) == -1) {
-			if (errno != EINTR)
-				err(1, "ppoll");
-
-			/*
-			 * If we've received an EINTR, it means that one
-			 * of our children has exited and we can reap it
-			 * and look up its identifier.
-			 * Then we respond to the parent.
-			 */
-
-			while ((pid = waitpid(WAIT_ANY, &st, WNOHANG)) > 0) {
-				for (i = 0; i < idsz; i++)
-					if (ids[i].pid == pid)
-						break;
-				assert(i < idsz);
-
-				if (!WIFEXITED(st)) {
-					warnx("rsync %s terminated abnormally",
-					    ids[i].uri);
-					rc = 1;
-				} else if (WEXITSTATUS(st) != 0) {
-					warnx("rsync %s failed", ids[i].uri);
-				}
-
-				io_simple_write(fd, &ids[i].id, sizeof(size_t));
-				free(ids[i].uri);
-				ids[i].uri = NULL;
-				ids[i].pid = 0;
-				ids[i].id = 0;
-			}
-			if (pid == -1 && errno != ECHILD)
-				err(1, "waitpid");
-			continue;
-		}
-
-		/*
-		 * Read til the parent exits.
-		 * That will mean that we can safely exit.
-		 */
-
-		if ((ssz = read(fd, &id, sizeof(size_t))) == -1)
-			err(1, "read");
-		if (ssz == 0)
-			break;
-
-		/* Read host and module. */
-
-		io_str_read(fd, &host);
-		io_str_read(fd, &mod);
-
-		if (noop) {
-			io_simple_write(fd, &id, sizeof(size_t));
-			free(host);
-			free(mod);
-			continue;
-		}
-
-		/*
-		 * Create source and destination locations.
-		 * Build up the tree to this point because GPL rsync(1)
-		 * will not build the destination for us.
-		 */
-
-		if (mkdir(host, 0700) == -1 && EEXIST != errno)
-			err(1, "%s", host);
-
-		if (asprintf(&dst, "%s/%s", host, mod) == -1)
-			err(1, NULL);
-		if (mkdir(dst, 0700) == -1 && EEXIST != errno)
-			err(1, "%s", dst);
-
-		if (asprintf(&uri, "rsync://%s/%s", host, mod) == -1)
-			err(1, NULL);
-
-		/* Run process itself, wait for exit, check error. */
-
-		if ((pid = fork()) == -1)
-			err(1, "fork");
-
-		if (pid == 0) {
-			if (pledge("stdio exec", NULL) == -1)
-				err(1, "pledge");
-			i = 0;
-			args[i++] = (char *)prog;
-			args[i++] = "-rt";
-			if (bind_addr != NULL) {
-				args[i++] = "--address";
-				args[i++] = (char *)bind_addr;
-			}
-			args[i++] = uri;
-			args[i++] = dst;
-			args[i] = NULL;
-			execvp(args[0], args);
-			err(1, "%s: execvp", prog);
-		}
-
-		/* Augment the list of running processes. */
-
-		for (i = 0; i < idsz; i++)
-			if (ids[i].pid == 0)
-				break;
-		if (i == idsz) {
-			ids = reallocarray(ids, idsz + 1, sizeof(*ids));
-			if (ids == NULL)
-				err(1, NULL);
-			idsz++;
-		}
-
-		ids[i].id = id;
-		ids[i].pid = pid;
-		ids[i].uri = uri;
-
-		/* Clean up temporary values. */
-
-		free(mod);
-		free(dst);
-		free(host);
-	}
-
-	/* No need for these to be hanging around. */
-	for (i = 0; i < idsz; i++)
-		if (ids[i].pid > 0) {
-			kill(ids[i].pid, SIGTERM);
-			free(ids[i].uri);
-		}
-
-	free(ids);
-	exit(rc);
-	/* NOTREACHED */
 }
 
 /*
@@ -1816,8 +1577,8 @@ main(int argc, char *argv[])
 			assert(i < rt.reposz);
 			assert(!rt.repos[i].loaded);
 			rt.repos[i].loaded = 1;
-			logx("%s/%s: loaded from cache", rt.repos[i].host,
-			    rt.repos[i].module);
+			logx("%s/%s: pull done, cache up to date",
+			    rt.repos[i].host, rt.repos[i].module);
 			stats.repos++;
 			entityq_flush(proc, &q, &rt.repos[i]);
 		}

@@ -43,6 +43,7 @@ tal_parse_buffer(const char *fn, char *buf)
 	int		 rc = 0, b64sz;
 	struct tal	*tal = NULL;
 	enum rtype	 rp;
+	enum repo_type	 repo_type;
 	EVP_PKEY	*pkey = NULL;
 
 	if ((tal = calloc(1, sizeof(struct tal))) == NULL)
@@ -60,12 +61,6 @@ tal_parse_buffer(const char *fn, char *buf)
 		if (*line == '\0')
 			break;
 
-		/* ignore https URI for now. */
-		if (strncasecmp(line, "https://", 8) == 0) {
-			warnx("%s: https schema ignored", line);
-			continue;
-		}
-
 		/* Append to list of URIs. */
 		tal->uri = reallocarray(tal->uri,
 			tal->urisz + 1, sizeof(char *));
@@ -79,7 +74,7 @@ tal_parse_buffer(const char *fn, char *buf)
 
 		/* Make sure we're a proper rsync URI. */
 		if (!rsync_uri_parse(NULL, NULL,
-		    NULL, NULL, NULL, NULL, &rp, line)) {
+		    NULL, NULL, NULL, NULL, &rp, &repo_type, line)) {
 			warnx("%s: RFC 7730 section 2.1: "
 			    "failed to parse URL: %s", fn, line);
 			goto out;

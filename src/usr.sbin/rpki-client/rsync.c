@@ -57,11 +57,11 @@ int
 rsync_uri_parse(const char **hostp, size_t *hostsz,
     const char **modulep, size_t *modulesz,
     const char **pathp, size_t *pathsz,
-    enum rtype *rtypep, const char *uri)
+    enum rtype *rtypep, enum repo_type *type,
+    const char *uri)
 {
 	const char	*host, *module, *path, *tmp;
 	size_t		 sz;
-	enum repo_type	 type;
 
 	/* Initialise all output values to NULL or 0. */
 
@@ -83,9 +83,9 @@ rsync_uri_parse(const char **hostp, size_t *hostsz,
 	/* Case-insensitive rsync URI. */
 
 	if (strncasecmp(uri, "rsync://", 8) == 0)
-		type = REPO_TYPE_RSYNC;
+		*type = REPO_TYPE_RSYNC;
 	else if (strncasecmp(uri, "https://", 8) == 0)
-		type = REPO_TYPE_RRDP;
+		*type = REPO_TYPE_RRDP;
 	else {
 		warnx("%s: not using rsync or https schema", uri);
 		return 0;
@@ -98,17 +98,21 @@ rsync_uri_parse(const char **hostp, size_t *hostsz,
 			*rtypep = RTYPE_ROA;
 		else if (strcasecmp(tmp, ".mft") == 0)
 			*rtypep = RTYPE_MFT;
-		else if (strcasecmp(tmp, ".cer") == 0)
+		else if (strcasecmp(tmp, ".cer") == 0) {
 			*rtypep = RTYPE_CER;
+			if (*type == REPO_TYPE_RRDP)
+				*type = REPO_TYPE_SINGLE;
+		}
 		else if (strcasecmp(tmp, ".crl") == 0)
 			*rtypep = RTYPE_CRL;
 		else if (strcasecmp(tmp, ".xml") == 0)
 			*rtypep = RTYPE_XML;
 	}
-	if (type == REPO_TYPE_RRDP && *rtypep != RTYPE_XML) {
-		warnx("%s: https link not an rrdp xml", uri);
+	if (*type == REPO_TYPE_RRDP && *rtypep != RTYPE_XML &&
+	    *rtypep != RTYPE_CER) {
+		warnx("%s: https link not an rrdp xml, or cer", uri);
 		return 0;
-	} else if (type == REPO_TYPE_RSYNC && *rtypep == RTYPE_XML) {
+	} else if (*type == REPO_TYPE_RSYNC && *rtypep == RTYPE_XML) {
 		warnx("%s: rsync link to an xml", uri);
 	}
 
@@ -224,7 +228,8 @@ xunveil_str(const char *prog) {
  * repositories and saturate our system.
  */
 void
-proc_rsync(char *prog, char *rrdp_prog, char *bind_addr, int fd)
+proc_rsync(char *prog, char *rrdp_prog, char *fetch_prog,
+	   char *bind_addr, int fd)
 {
 	size_t			 id, i, idsz = 0;
 	ssize_t			 ssz;
@@ -244,6 +249,7 @@ proc_rsync(char *prog, char *rrdp_prog, char *bind_addr, int fd)
 
 	xunveil_str(prog);
 	xunveil_str(rrdp_prog);
+	xunveil_str(fetch_prog);
 
 	/* Unveil the repository directory and terminate unveiling. */
 
@@ -367,7 +373,19 @@ proc_rsync(char *prog, char *rrdp_prog, char *bind_addr, int fd)
 				args[i++] = NULL;
 				execvp(args[0], args);
 				err(1, "%s: execvp", rrdp_prog);
+			} else if (type == REPO_TYPE_SINGLE) {
+				args[i++] = (char *)fetch_prog;
+				args[i++] = "-V";
+				args[i++] = "-U";
+				args[i++] = "rpki-client";
+				args[i++] = "-o";
+				args[i++] = local_loc;
+				args[i++] = remote_loc;
+				args[i++] = NULL;
+				execvp(args[0], args);
+				err(1, "%s: execvp", fetch_prog);
 			}
+
 		}
 
 		/* Augment the list of running processes. */

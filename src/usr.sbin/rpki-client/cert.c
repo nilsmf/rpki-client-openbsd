@@ -169,6 +169,7 @@ sbgp_sia_resource_mft(struct parse *p,
 	const unsigned char *d, size_t dsz)
 {
 	enum rtype rt;
+	enum repo_type repo_type;
 
 	if (p->res->mft != NULL) {
 		warnx("%s: RFC 6487 section 4.8.8: SIA: "
@@ -180,7 +181,7 @@ sbgp_sia_resource_mft(struct parse *p,
 
 	/* Make sure it's an MFT rsync address. */
 	if (!rsync_uri_parse(NULL, NULL, NULL,
-	    NULL, NULL, NULL, &rt, p->res->mft)) {
+	    NULL, NULL, NULL, &rt, &repo_type, p->res->mft)) {
 		warnx("%s: RFC 6487 section 4.8.8: SIA: "
 		    "failed to parse rsync URI", p->fn);
 		free(p->res->mft);

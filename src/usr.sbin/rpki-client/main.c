@@ -361,14 +361,14 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 
 	assert(filename != NULL);
 	if (rsync_uri_parse(&host, &hostsz, &mod, &modsz,
-	    &path, &pathsz, file_type, uri) == 0 || *file_type == RTYPE_EOF) {
+	    &path, &pathsz, file_type, &repo_type, uri) == 0 ||
+	    *file_type == RTYPE_EOF) {
 		warnx("url parse failed");
 		return NULL;
 	}
 
 	*filename = mod;
-	if (*file_type == RTYPE_XML) {
-		repo_type = REPO_TYPE_RRDP;
+	if (repo_type == REPO_TYPE_RRDP) {
 		/*
 		 * A little bit of reshuffling since rrdp cares about its parent
 		 * but not about the module
@@ -377,8 +377,6 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 		modsz = hostsz;
 		host = parent_host;
 		hostsz = strlen(host);
-	} else {
-		repo_type = REPO_TYPE_RSYNC;
 	}
 	/*
 	 * Look up in repository table.
@@ -403,7 +401,8 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 		if (strncasecmp(rt->repos[i].module, mod, modsz))
 			continue;
 		/* rrdp should never find an rsync module */
-		if (repo_type != rt->repos[i].type)
+		if (repo_type != rt->repos[i].type ||
+		    repo_type == REPO_TYPE_SINGLE)
 			continue;
 		best_repo_i = i;
 		/* if rrdp found an rrdp module then we're done */
@@ -430,21 +429,28 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 		err(1, "strndup");
 	if ((rp->module = strndup(mod, modsz)) == NULL)
 		err(1, "strndup");
-	if (rp->type == REPO_TYPE_RRDP) {
+	if (rp->type == REPO_TYPE_RSYNC) {
+		if ((rp->dir = strdup(rp->host)) == NULL)
+			err(1, "strdup");
+		if (asprintf(&rp->remote_loc, "rsync://%s/%s",
+		    rp->host, rp->module) == -1)
+			err(1, "asprintf");
+		if (asprintf(&rp->local_loc, "%s/%s", rp->host,
+			     rp->module) == -1)
+			err(1, "asprintf");
+	} else if (rp->type == REPO_TYPE_RRDP) {
 		if (asprintf(&rp->dir, "rrdp/%.*s", (int)modsz, mod) == -1)
 			err(1, "asprintf");
 		if ((rp->remote_loc = strdup(uri)) == NULL)
 			err(1, "strdup");
 		if ((rp->local_loc = strdup(rp->dir)) == NULL)
 			err(1, "strdup");
-	} else {
-		if ((rp->dir = strndup(host, hostsz)) == NULL)
-			err(1, "strndup");
-		if (asprintf(&rp->remote_loc, "rsync://%s/%s",
-		    rp->host, rp->module) == -1)
-			err(1, "asprintf");
-		if (asprintf(&rp->local_loc, "%s/%s", rp->host,
-			     rp->module) == -1)
+	} else if (rp->type == REPO_TYPE_SINGLE) {
+		if ((rp->dir = strdup(rp->host)) == NULL)
+			err(1, "strdup");
+		if ((rp->remote_loc = strdup(uri)) == NULL)
+			err(1, "strdup");
+		if (asprintf(&rp->local_loc, "%s/%s", rp->dir, *filename) == -1)
 			err(1, "asprintf");
 	}
 
@@ -1496,6 +1502,7 @@ main(int argc, char *argv[])
 	struct roa	**out = NULL;
 	char		*rsync_prog = "openrsync";
 	char		*rrdp_prog = "rrdp";
+	char		*fetch_prog = "/usr/bin/ftp";
 	char		*bind_addr = NULL;
 	const char	*cachedir = NULL;
 	const char	*tals[TALSZ_MAX];
@@ -1524,7 +1531,7 @@ main(int argc, char *argv[])
 	if (pledge("stdio rpath wpath cpath fattr proc exec unveil", NULL) == -1)
 		err(1, "pledge");
 
-	while ((c = getopt(argc, argv, "b:Bcd:e:jnor:t:T:v")) != -1)
+	while ((c = getopt(argc, argv, "b:Bcd:e:f:jnor:t:T:v")) != -1)
 		switch (c) {
 		case 'b':
 			bind_addr = optarg;
@@ -1540,6 +1547,9 @@ main(int argc, char *argv[])
 			break;
 		case 'e':
 			rsync_prog = optarg;
+			break;
+		case 'f':
+			fetch_prog = optarg;
 			break;
 		case 'j':
 			outformats |= FORMAT_JSON;
@@ -1651,7 +1661,8 @@ main(int argc, char *argv[])
 			    == -1)
 				err(1, "pledge");
 
-			proc_rsync(rsync_prog, rrdp_prog, bind_addr, fd[0]);
+			proc_rsync(rsync_prog, rrdp_prog, fetch_prog,
+				   bind_addr, fd[0]);
 			/* NOTREACHED */
 		}
 

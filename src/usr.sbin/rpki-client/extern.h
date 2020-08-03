@@ -22,7 +22,8 @@
 
 enum repo_type {
 	REPO_TYPE_RSYNC,
-	REPO_TYPE_RRDP
+	REPO_TYPE_RRDP,
+	REPO_TYPE_SINGLE
 };
 
 enum cert_as_type {
@@ -360,8 +361,8 @@ int		 as_check_covered(uint32_t, uint32_t,
 
 int		 rsync_uri_parse(const char **, size_t *,
 			const char **, size_t *, const char **, size_t *,
-			enum rtype *, const char *);
-void		 proc_rsync(char *, char *, char *,
+			enum rtype *, enum repo_type *, const char *);
+void		 proc_rsync(char *, char *, char *, char *,
 			int) __attribute__((noreturn));
 
 /* Logging (though really used for OpenSSL errors). */

@@ -39,8 +39,9 @@
  * of which process maps to which request.
  */
 struct	rsyncproc {
-	char	*fetch_info; /* uri of this rsync proc */
-	char	*dir; /* uri of this rsync proc */
+	char	*remote_loc; /* uri of this repo proc */
+	char	*local_loc; /* local path for repo */
+	char	*dir; /* dir for local path (kind of) */
 	size_t	 id; /* identity of request */
 	pid_t	 pid; /* pid of process or 0 if unassociated */
 };
@@ -218,8 +219,8 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 {
 	size_t			 id, i, idsz = 0;
 	ssize_t			 ssz;
-	char			*host = NULL, *mod = NULL, *dir = NULL,
-				*fetch_info = NULL,
+	char			*dir = NULL,
+				*remote_loc = NULL, *local_loc = NULL,
 				*dir_split;
 	pid_t			 pid;
 	char			*args[32];
@@ -271,17 +272,19 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 
 				if (!WIFEXITED(st)) {
 					warnx("rsync %s terminated abnormally",
-					    ids[i].fetch_info);
+					    ids[i].remote_loc);
 					rc = 1;
 				} else if (WEXITSTATUS(st) != 0) {
 					warnx("rsync %s failed",
-					      ids[i].fetch_info);
+					      ids[i].remote_loc);
 				}
 
 				io_simple_write(fd, &ids[i].id, sizeof(size_t));
-				free(ids[i].fetch_info);
+				free(ids[i].remote_loc);
+				free(ids[i].local_loc);
 				free(ids[i].dir);
-				ids[i].fetch_info = NULL;
+				ids[i].remote_loc = NULL;
+				ids[i].local_loc = NULL;
 				ids[i].dir = NULL;
 				ids[i].pid = 0;
 				ids[i].id = 0;
@@ -301,12 +304,11 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 		if (ssz == 0)
 			break;
 
-		/* Read host and module. */
+		/* Read fetch information */
 
 		io_str_read(fd, &dir);
-		io_str_read(fd, &fetch_info);
-		io_str_read(fd, &host);
-		io_str_read(fd, &mod);
+		io_str_read(fd, &remote_loc);
+		io_str_read(fd, &local_loc);
 
 		/*
 		 * Create source and destination locations.
@@ -316,11 +318,12 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 
 		/* XXXNF this should use something like mkpath from rrdp */
 		dir_split = strrchr(dir, '/');
-		assert(dir_split != NULL);
-		dir_split[0] = '\0';
-		if (mkdir(dir, 0700) == -1 && EEXIST != errno)
-			err(1, "%s", dir);
-		dir_split[0] = '/';
+		if (dir_split != NULL) {
+			dir_split[0] = '\0';
+			if (mkdir(dir, 0700) == -1 && EEXIST != errno)
+				err(1, "%s", dir);
+			dir_split[0] = '/';
+		}
 		if (mkdir(dir, 0700) == -1 && EEXIST != errno)
 			err(1, "%s", dir);
 
@@ -339,8 +342,8 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 				args[i++] = "--address";
 				args[i++] = (char *)bind_addr;
 			}
-			args[i++] = fetch_info;
-			args[i++] = dir;
+			args[i++] = remote_loc;
+			args[i++] = local_loc;
 			args[i] = NULL;
 			execvp(args[0], args);
 			err(1, "%s: execvp", prog);
@@ -360,20 +363,17 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 
 		ids[i].id = id;
 		ids[i].pid = pid;
-		ids[i].fetch_info = fetch_info;
+		ids[i].remote_loc = remote_loc;
+		ids[i].local_loc = local_loc;
 		ids[i].dir = dir;
-
-		/* Clean up temporary values. */
-
-		free(mod);
-		free(host);
 	}
 
 	/* No need for these to be hanging around. */
 	for (i = 0; i < idsz; i++)
 		if (ids[i].pid > 0) {
 			kill(ids[i].pid, SIGTERM);
-			free(ids[i].fetch_info);
+			free(ids[i].remote_loc);
+			free(ids[i].local_loc);
 			free(ids[i].dir);
 		}
 

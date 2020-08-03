@@ -81,7 +81,8 @@
  */
 struct	repo {
 	char		*dir; /* on disk location (relative to cwd) */
-	char		*fetch_info; /* uri that is used by rrdp or rsync */
+	char		*remote_loc; /* uri used by rrdp, ftp or rsync */
+	char		*local_loc; /* location used by rrdp, ftp or rsync */
 	char		*host; /* used for finding existing */
 	char		*module; /* used for finding existing */
 	int		 loaded; /* whether loaded or not */
@@ -304,7 +305,7 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 		return NULL;
 	}
 
-	*filename = path;
+	*filename = mod;
 	/* Look up in repository table. */
 
 	for (i = 0; i < rt->reposz; i++) {
@@ -334,21 +335,22 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 		err(1, "strndup");
 	if ((rp->module = strndup(mod, modsz)) == NULL)
 		err(1, "strndup");
-	if (asprintf(&rp->dir, "%s/%s", rp->host, rp->module) == -1)
-		err(1, "asprintf");
-	if (asprintf(&rp->fetch_info, "rsync://%s/%s",
+	if ((rp->dir = strndup(host, hostsz)) == NULL)
+		err(1, "strndup");
+	if (asprintf(&rp->remote_loc, "rsync://%s/%s",
 	    rp->host, rp->module) == -1)
+		err(1, "asprintf");
+	if (asprintf(&rp->local_loc, "%s/%s", rp->host, rp->module) == -1)
 		err(1, "asprintf");
 
 	i = rt->reposz - 1;
 
 	if (!noop) {
-		logx("pulling from network: %s", rp->fetch_info);
+		logx("pulling from network: %s", rp->remote_loc);
 		io_simple_write(fd, &i, sizeof(size_t));
 		io_str_write(fd, rp->dir);
-		io_str_write(fd, rp->fetch_info);
-		io_str_write(fd, rp->host);
-		io_str_write(fd, rp->module);
+		io_str_write(fd, rp->remote_loc);
+		io_str_write(fd, rp->local_loc);
 	} else {
 		rp->loaded = 1;
 		logx("loaded from cache: %s", rp->dir);
@@ -1585,7 +1587,7 @@ main(int argc, char *argv[])
 			assert(!rt.repos[i].loaded);
 			rt.repos[i].loaded = 1;
 			warnx("%s: pull done, cache up to date",
-			    rt.repos[i].fetch_info);
+			    rt.repos[i].remote_loc);
 			stats.repos++;
 			entityq_flush(proc, &q, &rt.repos[i]);
 		}
@@ -1664,7 +1666,8 @@ main(int argc, char *argv[])
 	for (i = 0; i < rt.reposz; i++) {
 		free(rt.repos[i].host);
 		free(rt.repos[i].module);
-		free(rt.repos[i].fetch_info);
+		free(rt.repos[i].remote_loc);
+		free(rt.repos[i].local_loc);
 		free(rt.repos[i].dir);
 	}
 	free(rt.repos);

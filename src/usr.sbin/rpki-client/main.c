@@ -352,12 +352,14 @@ entityq_switch_repo(struct entityq *q, struct repotab *rt, struct repo *rp,
  */
 static const struct repo *
 repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
-    int proc, char *parent_host, const char **filename, enum rtype *file_type)
+    int proc, char *repo_uri_domain, const char **filename,
+    enum rtype *file_type)
 {
-	const char	*host, *mod, *path;
-	size_t		 hostsz, modsz, pathsz, i, best_repo_i;
+	const char	*host, *mod, *path, *repo_domain;
+	size_t		 hostsz, modsz, pathsz, i, best_repo_i, repo_domainsz;
 	struct repo	*rp;
-	enum repo_type	 repo_type;
+	enum repo_type	 repo_type, repo_domain_type;
+	enum rtype	 repo_domain_file_type;
 
 	assert(filename != NULL);
 	if (rsync_uri_parse(&host, &hostsz, &mod, &modsz,
@@ -370,13 +372,21 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 	*filename = mod;
 	if (repo_type == REPO_TYPE_RRDP) {
 		/*
-		 * A little bit of reshuffling since rrdp cares about its parent
-		 * but not about the module
+		 * A little bit of reshuffling since rrdp cares about the mft
+		 * domain but not about the module
 		 */
+		if (repo_uri_domain == NULL ||
+		    rsync_uri_parse(&repo_domain, &repo_domainsz, NULL, NULL,
+		    NULL, NULL, &repo_domain_file_type, &repo_domain_type,
+		    repo_uri_domain) == 0 ||
+		    repo_domain_file_type != RTYPE_MFT) {
+			warnx("repo_domain not MFT failed RRDP xml");
+			return NULL;
+		}
 		mod = host;
 		modsz = hostsz;
-		host = parent_host;
-		hostsz = strlen(host);
+		host = repo_domain;
+		hostsz = repo_domainsz;
 	}
 	/*
 	 * Look up in repository table.
@@ -398,7 +408,7 @@ repo_lookup(int fd, struct repotab *rt, const char *uri, struct entityq *q,
 
 		if (strlen(rt->repos[i].module) != modsz)
 			continue;
-		if (strncasecmp(rt->repos[i].module, mod, modsz))
+		if (strncasecmp(rt->repos[i].module, mod, modsz) != 0)
 			continue;
 		/* rrdp should never find an rsync module */
 		if (repo_type != rt->repos[i].type ||
@@ -694,14 +704,14 @@ queue_add_from_tal(int proc, int rsync, struct entityq *q,
  */
 static void
 queue_add_from_cert(int proc, int rsync, struct entityq *q,
-    const char *uri, struct repotab *rt, size_t *eid, char *parent_host)
+    const char *uri, struct repotab *rt, size_t *eid, char *repo_uri_domain)
 {
 	enum rtype		 type;
 	const struct repo	*repo;
 	const char		*filename;
 
 	/* Look up the repository. */
-	repo = repo_lookup(rsync, rt, uri, q, proc, parent_host, &filename,
+	repo = repo_lookup(rsync, rt, uri, q, proc, repo_uri_domain, &filename,
 	    &type);
 	if (repo == NULL || (type != RTYPE_MFT && type != RTYPE_XML))
 		errx(1, "%d, %s: invalid file type %s", type, uri, repo ? "y": "NULL");
@@ -1318,16 +1328,16 @@ entity_process(int proc, int rsync, struct stats *st,
 			 * we're revoked and then we don't want to
 			 * process the MFT.
 			 */
-			if (cert->notify != NULL && *cert->notify != '\0') {
-				queue_add_from_cert(proc, rsync, q,
-				    cert->notify, rt, eid,
-				    rt->repos[ent->repo].host);
-			}
 
 			if (cert->mft != NULL && *cert->mft != '\0') {
+				if (cert->notify != NULL &&
+				    *cert->notify != '\0') {
+					queue_add_from_cert(proc, rsync, q,
+					    cert->notify, rt, eid,
+					    cert->mft);
+				}
 				queue_add_from_cert(proc, rsync, q,
-				    cert->mft, rt, eid,
-				    rt->repos[ent->repo].host);
+				    cert->mft, rt, eid, NULL);
 			}
 
 		} else
